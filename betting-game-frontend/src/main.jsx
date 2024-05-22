@@ -9,7 +9,7 @@ import {
 } from "@rainbow-me/rainbowkit";
 
 import { configureChains, createClient, WagmiConfig } from "wagmi";
-import {  sepolia} from "wagmi/chains";
+import {  avalancheFuji, sepolia , moonbaseAlpha} from "wagmi/chains";
 import { publicProvider } from "wagmi/providers/public";
 
 //routes import
@@ -33,7 +33,7 @@ const gamingl3chain = {
 
 //wagmi
 const { chains, provider } = configureChains(
-  [gamingl3chain],
+  [gamingl3chain, avalancheFuji, ],
   [publicProvider()]
 );
 

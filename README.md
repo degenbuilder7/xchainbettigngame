@@ -1,14 +1,6 @@
-# Realtime Betting Game on L3 OP-MODE-CELESTIA ROLLUP
+# Realtime CrossChain Betting Game on Avalanche 
 
-Welcome to the Realtime Betting Game built on the L3 OP-MODE-CELESTIA Chain! This project brings the excitement of betting on a roulette-style game to the blockchain. Players can wager on various outcomes and see results in real-time, all powered by GELLATO VRF, Hyperlane, and Kurtosis technologies.
-
-<div style="display:flex;justify-content:center">
-  <img src="https://github.com/degenbuilder7/realtime-betting-game-on-l3/assets/94379406/2d9f0128-46c7-4920-b17f-717155499078" alt="Screenshot">
-</div>
-
-## Architecture of the project
-
-![image](https://github.com/degenbuilder7/realtime-betting-game-on-l3/assets/94379406/348511e9-4d03-47b3-a6a8-fec8217d14c9)
+Welcome to the Realtime Betting Game built using chainlink VRFV2! This project brings the excitement of betting on a roulette-style game to the blockchain. Players can wager on various outcomes and see results in real-time.
 
 ## How to Play
 

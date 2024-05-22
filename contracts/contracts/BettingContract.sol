@@ -1,66 +1,81 @@
 //SPDX-License-Identifier: MIT
-
 /*******************************************
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-~~~~~~~~~~~~~~~~~ REALTIME Betting Game on L3 OP-MODE_CELESTIA CHAIN ~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~ XChain BETTING  ~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+--------------------------------------------
       3 6 9 12 15 18 21 24 27 30 33 36
     0 2 5 8 11 14 17 20 23 26 29 32 35
       1 4 7 10 13 16 19 22 25 28 31 34
 --------------------------------------------  
  <Even|Odd> ~~ <Black|Red> ~~ <1st|2nd> ~~ <1st|2nd|3rd> 
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-*******************************************/
 
-/*** @notice REALTIME ON-Chain Betting on L3 OP-MODE_CELESTIA CHAIN powered by GELLATO VRF
+/*** @notice on-chain Betting Game using ChainLink VRFV2.
+ *** Immutable after deployment except for setSponserwallet().
  *** Only supports one bet (single number, black/red, even/odd, 1st/2nd or 1st/2nd/3rd of board) per spin.
- *** User places bet by calling applicable payable function, then calls spinBettingWheel(),
- *** hardcoded minimum bet of .001 ETH , winnings paid from this contract **/
-/// @title Betting
-/// Betting odds should prevent the House (this contract) and sponsorWallet from bankruptcy, but anyone can refill by sending ETH directly to this address.
+ *** User places bet by calling applicable payable function, then calls spinRouletteWheel(),
+ *** then calls checkIf[BetType]Won() after VRF responds with spinResult for user
+ *** following the applicable chain's minimum confirmations (25 for Optimism)
+ *** hardcoded minimum bet of .001 ETH to prevent spam of sponsorWallet, winnings paid from this contract **/
+/// @title OnchainBetting
+/// Roulette odds should prevent the casino (this contract) and sponsorWallet from bankruptcy, but anyone can refill by sending ETH directly to address
 
 pragma solidity >=0.8.4;
 
-import "@hyperlane-xyz/core/contracts/interfaces/IMailbox.sol";
-import "@hyperlane-xyz/core/contracts/interfaces/IInterchainSecurityModule.sol";
+import {VRFConsumerBaseV2Plus} from "@chainlink/contracts/src/v0.8/vrf/dev/VRFConsumerBaseV2Plus.sol";
+import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
 
+contract OnchainBetting is VRFConsumerBaseV2Plus {
+  uint256 public constant MIN_BET = 10000000000000; // .001 ETH
+  uint256 spinCount;
+  address airnode;
+  address immutable deployer;
+  address payable sponsorWallet;
+  bytes32 endpointId;
 
-contract BettingContract  {
-    uint256 public constant MIN_BET = 10000000000000; // .001 ETH
-    uint256 spinCount;
-    address immutable deployer;
-    address payable sponsorWallet;
-    bytes32 endpointId;
+  // chainlink vrf 
 
-    uint256 public randomnumber;
- 
-    IMailbox inbox;
-    bytes32 public lastSender;
-    string public lastMessage;
+      event RequestSent(uint256 requestId, uint32 numWords);
+    event RequestFulfilled(uint256 requestId, uint256[] randomWords);
 
-    event ReceivedRandomNumber(uint32 origin, bytes32 sender, bytes message);
-
-    IInterchainSecurityModule public interchainSecurityModule;
-
-    function setInterchainSecurityModule(address _module) public {
-        interchainSecurityModule = IInterchainSecurityModule(_module);
+    struct RequestStatus {
+        bool fulfilled; // whether the request has been successfully fulfilled
+        bool exists; // whether a requestId exists
+        uint256[] randomWords;
     }
+    mapping(uint256 => RequestStatus)
+        public s_requests; /* requestId --> requestStatus */
 
-    function handle(
-        uint32 _origin,
-        bytes32 _sender,
-        bytes calldata _message
-    ) external {
-        lastSender = _sender;
-        lastMessage = string(_message);
-        bytes memory messageBytes = _message;
-        uint256 randomeNumber;
-        require(messageBytes.length == 32, "Message length must be 32 bytes");
-            assembly {
-                randomeNumber := mload(add(messageBytes, 32))
-            }
-        randomnumber = randomeNumber;
-        emit ReceivedRandomNumber(_origin, _sender, _message);
-    }
+    // Your subscription ID.
+    uint256 public s_subscriptionId;
+
+    // Past request IDs.
+    uint256[] public requestIds;
+    uint256 public lastRequestId;
+
+    // The gas lane to use, which specifies the maximum gas price to bump to.
+    // For a list of available gas lanes on each network,
+    // see https://docs.chain.link/docs/vrf/v2-5/supported-networks
+    bytes32 public keyHash =
+        0x787d74caea10b2b357790d5b5247c2f63d1d91572a9846f780606e4d953677ae;
+
+    // Depends on the number of requested values that you want sent to the
+    // fulfillRandomWords() function. Storing each word costs about 20,000 gas,
+    // so 100,000 is a safe default for this example contract. Test and adjust
+    // this limit based on the network that you select, the size of the request,
+    // and the processing of the callback request in the fulfillRandomWords()
+    // function.
+    uint32 public callbackGasLimit = 100000;
+
+    // The default is 3, but you can set this higher.
+    uint16 public requestConfirmations = 1;
+
+    // For this example, retrieve 2 random values in one request.
+    // Cannot exceed VRFCoordinatorV2_5.MAX_NUM_WORDS.
+    uint32 public numWords = 1;
 
   // ~~~~~~~ ENUMS ~~~~~~~
 
@@ -88,8 +103,10 @@ contract BettingContract  {
   mapping(address => uint256) public userToThird;
   mapping(address => uint256) public userToHalf;
 
-  mapping(bytes32 => uint256) public requestIdToSpinCount;
-  mapping(bytes32 => uint256) public requestIdToResult;
+  mapping(uint256 => bool) expectingRequestWithIdToBeFulfilled;
+
+  mapping(uint256 => uint256) public requestIdToSpinCount;
+  mapping(uint256 => uint256) public requestIdToResult;
 
   mapping(uint256 => bool) blackNumber;
   mapping(uint256 => bool) public blackSpin;
@@ -111,76 +128,87 @@ contract BettingContract  {
 
   // ~~~~~~~ EVENTS ~~~~~~~
 
-  event RequestedUint256(bytes32 requestId);
-  event ReceivedUint256(bytes32 indexed requestId, uint256 response);
-  event SpinComplete(bytes32 indexed requestId, uint256 indexed spinNumber, uint256 vrfResult);
+  event RequestedUint256(uint256 requestId);
+  event ReceivedUint256(uint256 indexed requestId, uint256 response);
+  event SpinComplete(uint256 indexed requestId, uint256 indexed spinNumber, uint256 qrngResult);
   event WinningNumber(uint256 indexed spinNumber, uint256 winningNumber);
 
-  constructor(address _inbox, address payable _sponsorWallet)  {
-    sponsorWallet = _sponsorWallet;
-    inbox = IMailbox(_inbox);
-    deployer = msg.sender;
-    blackNumber[2] = true;
-    blackNumber[4] = true;
-    blackNumber[6] = true;
-    blackNumber[8] = true;
-    blackNumber[10] = true;
-    blackNumber[11] = true;
-    blackNumber[13] = true;
-    blackNumber[15] = true;
-    blackNumber[17] = true;
-    blackNumber[20] = true;
-    blackNumber[22] = true;
-    blackNumber[24] = true;
-    blackNumber[26] = true;
-    blackNumber[28] = true;
-    blackNumber[29] = true;
-    blackNumber[31] = true;
-    blackNumber[33] = true;
-    blackNumber[35] = true;
-  }
+  /// sponsorWallet must be derived from address(this) after deployment
+
+    constructor(
+        uint256 subscriptionId
+    ) VRFConsumerBaseV2Plus(0x9DdfaCa8183c41ad55329BdeeD9F6A8d53168B1B) {
+        s_subscriptionId = subscriptionId;
+            deployer = msg.sender;
+            blackNumber[2] = true;
+            blackNumber[4] = true;
+            blackNumber[6] = true;
+            blackNumber[8] = true;
+            blackNumber[10] = true;
+            blackNumber[11] = true;
+            blackNumber[13] = true;
+            blackNumber[15] = true;
+            blackNumber[17] = true;
+            blackNumber[20] = true;
+            blackNumber[22] = true;
+            blackNumber[24] = true;
+            blackNumber[26] = true;
+            blackNumber[28] = true;
+            blackNumber[29] = true;
+            blackNumber[31] = true;
+            blackNumber[33] = true;
+            blackNumber[35] = true;
+    }
+
 
   /// @notice for user to spin after bet is placed
   /// @param _spinCount the msg.sender's spin number assigned when bet placed
-    function _spinBettingWheel(uint256 _spinCount) internal {
-        require(!spinIsComplete[_spinCount], "spin already complete");
-        require(_spinCount == userToSpinCount[msg.sender], "!= msg.sender spinCount");
+  function _spinRouletteWheel(uint256 _spinCount) internal {
+    require(!spinIsComplete[_spinCount], "spin already complete");
+    require(_spinCount == userToSpinCount[msg.sender], "!= msg.sender spinCount");
 
-        // No need for external calls, since we already have the random number
-        // Directly handle the spin completion
-        _spinComplete(_spinCount, randomnumber);
-    }
+        uint256 requestId = s_vrfCoordinator.requestRandomWords(
+            VRFV2PlusClient.RandomWordsRequest({
+                keyHash: keyHash,
+                subId: s_subscriptionId,
+                requestConfirmations: requestConfirmations,
+                callbackGasLimit: callbackGasLimit,
+                numWords: numWords,
+                extraArgs: VRFV2PlusClient._argsToBytes(
+                    VRFV2PlusClient.ExtraArgsV1({
+                        nativePayment: false
+                    })
+                )
+            })
+        );
+    expectingRequestWithIdToBeFulfilled[requestId] = true;
+    requestIdToSpinCount[requestId] = _spinCount;
+    emit RequestedUint256(requestId);
+  }
 
-    function _spinComplete(uint256 _spin, uint256 _vrfUint256) internal {
-        require(!spinIsComplete[_spin], "spin already complete");
-
-        spinResult[_spin] = _vrfUint256 % 37; // Ensure result is within the range [0, 36]
-        spinIsComplete[_spin] = true;
-        emit SpinComplete("spincomplete",_spin, spinResult[_spin]);
-
-        // Check if any bet type has won based on the completed spin
-        if (spinToBetType[_spin] == BetType.Number) {
-            checkIfNumberWon(_spin);
-        } else if (spinToBetType[_spin] == BetType.Color) {
-            checkIfColorWon(_spin);
-        } else if (spinToBetType[_spin] == BetType.EvenOdd) {
-            checkIfEvenOddWon(_spin);
-        } else if (spinToBetType[_spin] == BetType.Half) {
-            checkIfHalfWon(_spin);
-        } else if (spinToBetType[_spin] == BetType.Third) {
-            checkIfThirdWon(_spin);
-        }
-    }
+  /** @dev chainlinkvrf will call back with a response
+   *** if no response returned (0) user will have bet returned (see check functions) */
+  function fulfillRandomWords(uint256 requestId, uint256[] calldata _randomWords) internal override  {
+    require(expectingRequestWithIdToBeFulfilled[requestId], "Unexpected Request ID");
+    expectingRequestWithIdToBeFulfilled[requestId] = false;
+        s_requests[requestId].fulfilled = true;
+        s_requests[requestId].randomWords = _randomWords;
+    uint256 _qrngUint256 = _randomWords[0];
+    requestIdToResult[requestId] = _qrngUint256;
+    _spinComplete(requestId, _qrngUint256);
+    finalNumber = (_qrngUint256 % 37);
+    emit ReceivedUint256(requestId, _qrngUint256);
+  }
 
   /** @dev a failed fulfill (return 0) assigned 37 to avoid modulo problem
    *** in spinResult calculations in above functions,
-   *** otherwise assigns the vrf result to the applicable spin number **/
-  function _spinComplete(bytes32 _requestId, uint256 _vrfUint256) internal {
+   *** otherwise assigns the QRNG result to the applicable spin number **/
+  function _spinComplete(uint256 _requestId, uint256 _qrngUint256) internal {
     uint256 _spin = requestIdToSpinCount[_requestId];
-    if (_vrfUint256 == 0) {
+    if (_qrngUint256 == 0) {
       spinResult[_spin] = 37;
     } else {
-      spinResult[_spin] = _vrfUint256;
+      spinResult[_spin] = _qrngUint256;
     }
     spinIsComplete[_spin] = true;
     if (spinToBetType[_spin] == BetType.Number) {
@@ -197,13 +225,24 @@ contract BettingContract  {
     emit SpinComplete(_requestId, _spin, spinResult[_spin]);
   }
 
+  function setSponserwallet(address payable _sponsorWallet) external {
+    require(msg.sender == deployer, "msg.sender not deployer");
+    sponsorWallet = _sponsorWallet;
+  }
+
+
+  function topUpSponsorWallet() external payable {
+    require(msg.value != 0, "msg.value == 0");
+    (bool sent, ) = sponsorWallet.call{ value: msg.value }("");
+    if (!sent) revert TransferToSponsorWalletFailed();
+  }
 
   // to refill the "house" (address(this)) if bankrupt
   receive() external payable {}
 
   /// @notice for user to submit a single-number bet, which pays out 35:1 if correct after spin
   /// @param _numberBet number between 0 and 36
-  /// @return userToSpinCount[msg.sender] spin count for this msg.sender, to enter in spinBettingWheel()
+  /// @return userToSpinCount[msg.sender] spin count for this msg.sender, to enter in spinRouletteWheel()
   function betNumber(uint256 _numberBet) external payable returns (uint256) {
     require(_numberBet < 37, "_numberBet is > 36");
     require(msg.value >= MIN_BET, "msg.value < MIN_BET");
@@ -217,7 +256,7 @@ contract BettingContract  {
     userToNumber[msg.sender] = _numberBet;
     userBetANumber[msg.sender] = true;
     spinToBetType[spinCount] = BetType.Number;
-    _spinBettingWheel(spinCount);
+    _spinRouletteWheel(spinCount);
     return (userToSpinCount[msg.sender]);
   }
 
@@ -249,7 +288,7 @@ contract BettingContract  {
 
   /// @notice submit bet and "1", "2", or "3" for a bet on 1st/2nd/3rd of table, which pays out 3:1 if correct after spin
   /// @param _oneThirdBet uint 1, 2, or 3 to represent first, second or third of table
-  /// @return userToSpinCount[msg.sender] spin count for this msg.sender, to enter in spinBettingWheel()
+  /// @return userToSpinCount[msg.sender] spin count for this msg.sender, to enter in spinRouletteWheel()
   function betOneThird(uint256 _oneThirdBet) external payable returns (uint256) {
     require(_oneThirdBet == 1 || _oneThirdBet == 2 || _oneThirdBet == 3, "_oneThirdBet not 1 or 2 or 3");
     require(msg.value >= MIN_BET, "msg.value < MIN_BET");
@@ -263,7 +302,7 @@ contract BettingContract  {
     userToThird[msg.sender] = _oneThirdBet;
     userBetThird[msg.sender] = true;
     spinToBetType[spinCount] = BetType.Third;
-    _spinBettingWheel(spinCount);
+    _spinRouletteWheel(spinCount);
     return (userToSpinCount[msg.sender]);
   }
 
@@ -311,7 +350,7 @@ contract BettingContract  {
   // make similar function as above for halves
     /// @notice submit bet and "1" or "2" for a bet on 1st/2nd/3rd of table, which pays out 2:1 if correct after spin
   /// @param _halfBet uint 1 or 2 to represent first or second half of table
-  /// @return userToSpinCount[msg.sender] spin count for this msg.sender, to enter in spinBettingWheel()
+  /// @return userToSpinCount[msg.sender] spin count for this msg.sender, to enter in spinRouletteWheel()
   function betHalf(uint256 _halfBet) external payable returns (uint256) {
 	 require(_halfBet == 1 || _halfBet == 2, "_halfBet not 1 or 2");
 	 require(msg.value >= MIN_BET, "msg.value < MIN_BET");
@@ -325,7 +364,7 @@ contract BettingContract  {
 	 userToHalf[msg.sender] = _halfBet;
 	 userBetHalf[msg.sender] = true;
 	 spinToBetType[spinCount] = BetType.Half;
-	 _spinBettingWheel(spinCount);
+	 _spinRouletteWheel(spinCount);
 	 return (userToSpinCount[msg.sender]);
   }
 
@@ -369,9 +408,9 @@ contract BettingContract  {
 
 
   /** @notice for user to submit a boolean even or odd bet, which pays out 2:1 if correct
-   *** reminder that a return of 0 is neither even nor odd in Betting **/
+   *** reminder that a return of 0 is neither even nor odd in roulette **/
   /// @param _isEven boolean bet, true for even
-  /// @return userToSpinCount[msg.sender] spin count for this msg.sender, to enter in spinBettingWheel()
+  /// @return userToSpinCount[msg.sender] spin count for this msg.sender, to enter in spinRouletteWheel()
   function betEvenOdd(bool _isEven) external payable returns (uint256) {
     require(msg.value >= MIN_BET, "msg.value < MIN_BET");
     if (address(this).balance < msg.value * 2) revert HouseBalanceTooLow();
@@ -386,7 +425,7 @@ contract BettingContract  {
       userToEven[msg.sender] = true;
     } else {}
     spinToBetType[spinCount] = BetType.EvenOdd;
-    _spinBettingWheel(spinCount);
+    _spinRouletteWheel(spinCount);
     return (userToSpinCount[msg.sender]);
   }
 
@@ -424,9 +463,9 @@ contract BettingContract  {
   }
 
   /** @notice for user to submit a boolean black or red bet, which pays out 2:1 if correct
-   *** reminder that 0 is neither red nor black in Betting **/
+   *** reminder that 0 is neither red nor black in roulette **/
   /// @param _isBlack boolean bet, true for black, false for red
-  /// @return userToSpinCount[msg.sender] spin count for this msg.sender, to enter in spinBettingWheel()
+  /// @return userToSpinCount[msg.sender] spin count for this msg.sender, to enter in spinRouletteWheel()
   function betColor(bool _isBlack) external payable returns (uint256) {
     require(msg.value >= MIN_BET, "msg.value < MIN_BET");
     if (address(this).balance < msg.value * 2) revert HouseBalanceTooLow();
@@ -441,7 +480,7 @@ contract BettingContract  {
       userToColor[msg.sender] = true;
     } else {}
     spinToBetType[spinCount] = BetType.Color;
-    _spinBettingWheel(spinCount);
+    _spinRouletteWheel(spinCount);
     return (userToSpinCount[msg.sender]);
   }
 

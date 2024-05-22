@@ -11,6 +11,7 @@
   "dependencies": {
     "@api3/airnode-admin": "0.10.0",
     "@api3/airnode-protocol": "0.10.0",
+    "@chainlink/contracts": "^1.1.1",
     "@hyperlane-xyz/core": "^3.11.1",
     "@openzeppelin/contracts": "4.8.1"
   },
